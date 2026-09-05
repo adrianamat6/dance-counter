@@ -1,20 +1,86 @@
 <ion-header [translucent]="true">
   <ion-toolbar>
-    <ion-title>
-      Blank
-    </ion-title>
+    <ion-title>Dance Counter</ion-title>
   </ion-toolbar>
 </ion-header>
 
-<ion-content [fullscreen]="true">
-  <ion-header collapse="condense">
-    <ion-toolbar>
-      <ion-title size="large">Blank</ion-title>
-    </ion-toolbar>
-  </ion-header>
+<ion-content [fullscreen]="true" class="counter-content">
+  <div class="stage">
+    <div
+      class="beat-dots"
+      [attr.aria-label]="'Tiempo ' + counter.currentBeat() + ' de ' + counter.beatsPerBar()"
+    >
+      @for (i of counter.beatIndexes(); track i) {
+        <span
+          class="dot"
+          [class.active]="counter.currentBeat() === i + 1"
+          [class.is-one]="i === 0"
+        ></span>
+      }
+    </div>
 
-  <div id="container">
-    <strong>Ready to create an app?</strong>
-    <p>Start with Ionic <a target="_blank" rel="noopener noreferrer" href="https://ionicframework.com/docs/components">UI Components</a></p>
+    <button
+      type="button"
+      class="beat-number"
+      [class.pulse-one]="counter.currentBeat() === 1"
+      [disabled]="mode === 'mic'"
+      (click)="onTap()"
+    >
+      {{ counter.currentBeat() }}
+    </button>
+
+    <p class="hint">
+      @if (mode === 'manual') {
+        Toca el número al ritmo de la música
+      } @else if (counter.isListening()) {
+        Escuchando el micrófono...
+      }
+    </p>
+
+    @if (counter.bpm(); as bpm) {
+      <p class="bpm">{{ bpm }} bpm aprox.</p>
+    }
+
+    @if (counter.micError(); as error) {
+      <p class="error">{{ error }}</p>
+    }
+  </div>
+
+  <div class="controls">
+    <ion-segment [value]="mode" (ionChange)="setMode($any($event).detail.value)">
+      <ion-segment-button value="manual">
+        <ion-label>Manual</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="mic">
+        <ion-icon name="mic-outline"></ion-icon>
+        <ion-label>Micrófono</ion-label>
+      </ion-segment-button>
+    </ion-segment>
+
+    <ion-segment
+      [value]="counter.beatsPerBar()"
+      (ionChange)="setBeatsPerBar(+$any($event).detail.value)"
+    >
+      <ion-segment-button [value]="3">
+        <ion-label>3 tiempos</ion-label>
+      </ion-segment-button>
+      <ion-segment-button [value]="4">
+        <ion-label>4 tiempos</ion-label>
+      </ion-segment-button>
+      <ion-segment-button [value]="8">
+        <ion-label>8 tiempos</ion-label>
+      </ion-segment-button>
+    </ion-segment>
+
+    <div class="actions">
+      <ion-button fill="outline" (click)="counter.markAsOne()">
+        <ion-icon slot="start" name="flag-outline"></ion-icon>
+        Marcar el 1
+      </ion-button>
+      <ion-button fill="clear" (click)="counter.reset()">
+        <ion-icon slot="start" name="refresh-outline"></ion-icon>
+        Reiniciar
+      </ion-button>
+    </div>
   </div>
 </ion-content>

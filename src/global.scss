@@ -35,3 +35,16 @@
 /* @import "@ionic/angular/css/palettes/dark.always.css"; */
 /* @import "@ionic/angular/css/palettes/dark.class.css"; */
 @import '@ionic/angular/css/palettes/dark.system.css';
+
+/**
+ * Dance Counter theme
+ * -----------------------------------------------------
+ * La app vive siempre en un fondo oscuro cálido: se usa de pie, en salas
+ * con poca luz, y el contraste importa más que seguir el tema del sistema.
+ */
+:root {
+  --ion-background-color: #140f1a;
+  --ion-text-color: #f3ecf5;
+  --ion-toolbar-background: #140f1a;
+  --ion-toolbar-color: #f3ecf5;
+}
