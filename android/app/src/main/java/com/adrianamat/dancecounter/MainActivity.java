@@ -2,22 +2,32 @@ package com.adrianamat.dancecounter;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.media.AudioManager;
 import android.os.Bundle;
 import android.webkit.PermissionRequest;
+import android.webkit.WebChromeClient;
+import android.webkit.WebView;
 import androidx.core.content.ContextCompat;
 import com.getcapacitor.BridgeActivity;
-import com.getcapacitor.BridgeWebChromeClient;
 
 public class MainActivity extends BridgeActivity {
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        hookMicrophonePermissions();
+    }
 
-        // El permiso de Android (Ajustes > Apps > Permisos) es una cosa.
-        // El WebView necesita que, ADEMÁS, se le conceda explícitamente el
-        // acceso cuando la página llama a getUserMedia. Sin esto, la petición
-        // se rechaza aunque el permiso del sistema esté concedido.
-        bridge.getWebView().setWebChromeClient(new BridgeWebChromeClient(bridge) {
+    @Override
+    public void onResume() {
+        super.onResume();
+        hookMicrophonePermissions();
+    }
+
+    private void hookMicrophonePermissions() {
+        WebView webView = bridge.getWebView();
+
+        webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
                 runOnUiThread(() -> {
@@ -33,5 +43,10 @@ public class MainActivity extends BridgeActivity {
                 });
             }
         });
+
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager != null) {
+            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+        }
     }
 }
