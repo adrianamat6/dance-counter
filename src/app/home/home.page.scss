@@ -1,27 +1,111 @@
-#container {
+:host {
+  --ink: #140f1a;
+  --surface: #1f1728;
+  --accent-one: #ff5a6e;
+  --accent-rest: #6ee7c7;
+  --text: #f3ecf5;
+  --text-muted: #8b7f97;
+}
+
+ion-content.counter-content {
+  --background: var(--ink);
+  --color: var(--text);
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 48px 24px 24px;
+  min-height: 62vh;
+}
+
+.beat-dots {
+  display: flex;
+  gap: 10px;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--text-muted);
+  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.dot.active {
+  background: var(--accent-rest);
+  border-color: var(--accent-rest);
+  transform: scale(1.3);
+}
+
+.dot.active.is-one {
+  background: var(--accent-one);
+  border-color: var(--accent-one);
+}
+
+.beat-number {
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  font-size: 168px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text);
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  -webkit-tap-highlight-color: transparent;
+
+  &:disabled {
+    opacity: 1; // sigue siendo la pantalla principal en modo micro, solo no responde al toque
+  }
+}
+
+.beat-number.pulse-one {
+  color: var(--accent-one);
+  text-shadow: 0 0 40px rgba(255, 90, 110, 0.45);
+}
+
+.hint {
+  font-size: 15px;
+  color: var(--text-muted);
+  margin: 0;
+  min-height: 20px;
   text-align: center;
-
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
 }
 
-#container strong {
-  font-size: 20px;
-  line-height: 26px;
-}
-
-#container p {
-  font-size: 16px;
-  line-height: 22px;
-
-  color: #8c8c8c;
-
+.bpm {
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
   margin: 0;
 }
 
-#container a {
-  text-decoration: none;
+.error {
+  font-size: 14px;
+  color: var(--accent-one);
+  text-align: center;
+  margin: 0;
+  max-width: 280px;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 0 20px 32px;
+
+  ion-segment {
+    --background: var(--surface);
+  }
+}
+
+.actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
 }
