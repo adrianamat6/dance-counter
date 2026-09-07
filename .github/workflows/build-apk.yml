@@ -14,6 +14,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
       - uses: actions/setup-java@v4
         with:
@@ -21,7 +22,7 @@ jobs:
           java-version: 21
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build web app
         run: npx ng build --configuration production
