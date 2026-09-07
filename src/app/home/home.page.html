@@ -39,6 +39,9 @@
 
     @if (counter.bpm(); as bpm) {
       <p class="bpm">{{ bpm }} bpm aprox.</p>
+      @if (counter.oneConfidence() > 0) {
+        <p class="bpm">1 detectado: {{ counter.oneConfidence() }}%</p>
+      }
     }
 
     @if (counter.micError(); as error) {
@@ -76,6 +79,10 @@
       <ion-button fill="outline" (click)="counter.markAsOne()">
         <ion-icon slot="start" name="flag-outline"></ion-icon>
         Marcar el 1
+      </ion-button>
+      <ion-button fill="outline" [disabled]="!counter.bpm()" (click)="counter.detectOne()">
+        <ion-icon slot="start" name="locate-outline"></ion-icon>
+        Detectar 1
       </ion-button>
       <ion-button fill="clear" (click)="counter.reset()">
         <ion-icon slot="start" name="refresh-outline"></ion-icon>

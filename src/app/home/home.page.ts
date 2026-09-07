@@ -11,7 +11,7 @@ import {
   IonButton,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import { micOutline, flagOutline, refreshOutline } from 'ionicons/icons';
+import { micOutline, flagOutline, refreshOutline, locateOutline } from 'ionicons/icons';
 import { BeatCounterService, CounterMode } from '../services/beat-counter.service';
 
 @Component({
@@ -35,7 +35,7 @@ export class HomePage {
   protected mode: CounterMode = 'manual';
 
   constructor() {
-    addIcons({ micOutline, flagOutline, refreshOutline });
+    addIcons({ micOutline, flagOutline, refreshOutline, locateOutline });
   }
 
   protected async setMode(mode: CounterMode): Promise<void> {
