@@ -34,7 +34,7 @@
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0",
     "zone.js": "~0.15.0",
-    "onnxruntime-web": "1.24.4"
+    "onnxruntime-web": "^1.29.0"
   },
   "devDependencies": {
     "@angular-devkit/build-angular": "20.3.28",
