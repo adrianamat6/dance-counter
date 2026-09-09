@@ -39,7 +39,6 @@ export class BeatCounterService {
   private lastNeuralAnalysisMs = 0;
   private neuralAnalysisBusy = false;
   private neuralDownbeatTimesMs: number[] = [];
-  private neuralBeatEvents: Array<{ timeMs: number; confidence: number; kind: 'beat' | 'downbeat' }> = [];
   private rafId: number | null = null;
   private beatTimerId: number | null = null;
 
@@ -125,7 +124,6 @@ export class BeatCounterService {
     this.previousSpectrum = null;
     this.autoOneLocked = false;
     this.neuralDownbeatTimesMs = [];
-    this.neuralBeatEvents = [];
     this.totalCapturedSamples = 0;
     this.audioCaptureStartMs = 0;
   }
@@ -200,7 +198,6 @@ export class BeatCounterService {
       this.lastNeuralAnalysisMs = 0;
       this.neuralAnalysisBusy = false;
       this.neuralDownbeatTimesMs = [];
-      this.neuralBeatEvents = [];
 
       void this.beatThis.init();
       this.isListening.set(true);
@@ -574,22 +571,17 @@ export class BeatCounterService {
     this.neuralAnalysisBusy = true;
 
     void this.beatThis.analyze(pcm, sampleRate, startTimeMs).then((events) => {
-      if (!events.length) return;
+      const downbeats = events
+        .filter((event) => event.kind === 'downbeat' && event.confidence >= 0.45)
+        .map((event) => event.timeMs)
+        .filter((time) => Number.isFinite(time));
 
-      // Keep the whole neural event history. The important change in v4 is that
-      // we no longer anchor to the last downbeat blindly: we use several bars of
-      // beat/downbeat evidence to choose the most likely bar phase.
-      this.neuralBeatEvents = this.uniqueSortedEvents([
-        ...this.neuralBeatEvents,
-        ...events.filter((event) => Number.isFinite(event.timeMs)),
-      ]).slice(-160);
-
-      const downbeats = this.neuralBeatEvents
-        .filter((event) => event.kind === 'downbeat' && event.confidence >= 0.40)
-        .map((event) => event.timeMs);
-
-      this.neuralDownbeatTimesMs = this.uniqueSortedTimes(downbeats).slice(-32);
-      this.applyNeuralSequence();
+      if (downbeats.length) {
+        this.neuralDownbeatTimesMs.push(...downbeats);
+        this.neuralDownbeatTimesMs = this.uniqueSortedTimes(this.neuralDownbeatTimesMs).slice(-24);
+        const latest = downbeats[downbeats.length - 1];
+        this.applyNeuralDownbeat(latest);
+      }
     }).finally(() => {
       this.neuralAnalysisBusy = false;
     });
@@ -607,211 +599,51 @@ export class BeatCounterService {
     return write === 0 ? out : out.subarray(write);
   }
 
-  /**
-   * Uses the full neural beat sequence to choose the bar phase.
-   *
-   * Beat This gives us two complementary signals:
-   *  - beat probability: where the pulse is
-   *  - downbeat probability: which pulse is likely to start a bar
-   *
-   * For each candidate downbeat we lay a 4-beat grid over several bars and
-   * score how well the observed neural beats land on that grid. This prevents
-   * a single strong kick from moving the 1 and avoids resetting 1..8 every bar.
-   */
-  private applyNeuralSequence(): void {
+  private applyNeuralDownbeat(timeMs: number): void {
     const bpm = this.bpm();
     if (!bpm || this.beatsPerBar() < 2) return;
 
-    const solution = this.findBestNeuralPhase();
-    if (!solution) return;
+    const interval = 60000 / bpm;
+    const recent = this.neuralDownbeatTimesMs.slice(-6);
 
-    const { anchorTime, confidence, beatInterval } = solution;
-    const now = performance.now();
+    // A single neural downbeat is useful, but two or more consistent
+    // downbeats are much stronger evidence that we found the bar phase.
+    if (recent.length >= 2) {
+      const spacings = [];
+      for (let i = 1; i < recent.length; i++) {
+        spacings.push(recent[i] - recent[i - 1]);
+      }
+      const nearBar = spacings.filter((spacing) => {
+        const bars = spacing / (interval * 4);
+        return bars >= 0.75 && bars <= 1.25;
+      });
 
-    // During startup, a strong multi-bar solution establishes the anchor.
-    // Afterwards we only nudge the anchor when the new solution is very close;
-    // this avoids musical jumps caused by an isolated false downbeat.
-    // Require meaningful multi-bar confidence before committing the first 1.
-    // This is intentionally stricter than the old single-downbeat shortcut.
-    if (!this.beatAnchorTime) {
-      if (confidence < 58) return;
-      this.beatAnchorTime = anchorTime;
-      this.oneConfidence.set(confidence);
+      if (nearBar.length > 0) {
+        const confidence = this.beatThis.lastDownbeatConfidence();
+        if (confidence >= 45) {
+          // The model is explicitly predicting the bar start. Do not force
+          // this timestamp through the old onset phase heuristic: a correct
+          // neural downbeat can be exactly 1, 2 or 3 beats away from the
+          // heuristic's current phase. Instead, replace the phase anchor.
+          this.beatAnchorTime = timeMs;
+          this.currentBeat.set(this.getBeatAtTime(performance.now()));
+          this.oneConfidence.set(Math.max(this.oneConfidence(), confidence));
+          this.autoOneLocked = true;
+          this.scheduleNextBeat(performance.now());
+        }
+        return;
+      }
+    }
+
+    // During startup accept one confident model downbeat as a provisional
+    // anchor. A later consistent prediction will confirm/correct it.
+    if (!this.beatAnchorTime && this.beatThis.lastDownbeatConfidence() >= 55) {
+      this.beatAnchorTime = timeMs;
+      this.currentBeat.set(this.getBeatAtTime(performance.now()));
+      this.oneConfidence.set(this.beatThis.lastDownbeatConfidence());
       this.autoOneLocked = true;
-      this.scheduleNextBeat(now);
-      this.currentBeat.set(this.getBeatAtTime(now));
-      return;
+      this.scheduleNextBeat(performance.now());
     }
-
-    const expectedNow = this.beatAnchorTime;
-    const nearestIndex = Math.round((anchorTime - expectedNow) / beatInterval);
-    const compatibleAnchor = expectedNow + nearestIndex * beatInterval;
-    const anchorError = anchorTime - compatibleAnchor;
-
-    // Only phase-correct gently. In particular, do not jump 1->4 or 5->1 just
-    // because the neural model found a new local maximum.
-    if (Math.abs(anchorError) < beatInterval * 0.18) {
-      const alpha = this.autoOneLocked ? 0.08 : 0.18;
-      this.beatAnchorTime += anchorError * alpha;
-    } else if (!this.autoOneLocked && confidence >= 58) {
-      // Before lock, allow the temporal tracker to replace a poor initial
-      // phase hypothesis. After lock, a full-beat phase jump is never applied
-      // automatically because it would visibly flip the dancer's 1/5.
-      this.beatAnchorTime = anchorTime;
-      this.scheduleNextBeat(now);
-    }
-
-    this.oneConfidence.set(Math.max(this.oneConfidence(), confidence));
-    this.autoOneLocked = this.autoOneLocked || confidence >= 58;
-  }
-
-  private findBestNeuralPhase(): {
-    anchorTime: number;
-    confidence: number;
-    beatInterval: number;
-  } | null {
-    const bpm = this.bpm();
-    const barBeats = 4; // Beat This bar position is 1..4; 8-count is layered above it.
-    if (!bpm || this.neuralBeatEvents.length < 8) return null;
-
-    const baseInterval = 60000 / bpm;
-    const beats = this.neuralBeatEvents
-      .filter((event) => event.kind === 'beat' && event.confidence >= 0.28)
-      .sort((a, b) => a.timeMs - b.timeMs);
-    const downbeats = this.neuralBeatEvents
-      .filter((event) => event.kind === 'downbeat' && event.confidence >= 0.40)
-      .sort((a, b) => a.timeMs - b.timeMs);
-
-    if (beats.length < 6 || downbeats.length < 1) return null;
-
-    // Let the neural beat sequence refine the tempo slightly around the onset
-    // estimator. We test half/double tempo alternatives but keep the current
-    // tempo as the preferred hypothesis.
-    const intervalCandidates = [
-      baseInterval * 0.985,
-      baseInterval,
-      baseInterval * 1.015,
-    ];
-
-    let best: { score: number; anchorTime: number; interval: number; support: number; downbeatSupport: number } | null = null;
-    let secondBest = -Infinity;
-
-    for (const interval of intervalCandidates) {
-      for (const downbeat of downbeats) {
-        const anchor = downbeat.timeMs;
-        const horizonBeats = Math.min(32, Math.max(16, Math.floor((performance.now() - anchor) / interval) + 1));
-        if (horizonBeats < 8) continue;
-
-        let beatScore = 0;
-        let support = 0;
-        let expectedCount = 0;
-        let downbeatScore = 0;
-        let downbeatSupport = 0;
-
-        for (let k = -8; k < horizonBeats; k++) {
-          const target = anchor + k * interval;
-          const nearest = this.nearestNeuralEvent(beats, target, interval * 0.22);
-          expectedCount++;
-          if (nearest) {
-            const error = Math.abs(nearest.timeMs - target) / interval;
-            beatScore += nearest.confidence * Math.max(0, 1 - error / 0.22);
-            support++;
-          } else {
-            // Missing beats are normal; penalize them mildly rather than making
-            // the detector require a percussive transient on every beat.
-            beatScore -= 0.12;
-          }
-
-          if (((k % barBeats) + barBeats) % barBeats === 0) {
-            const db = this.nearestNeuralEvent(downbeats, target, interval * 0.24);
-            if (db) {
-              const error = Math.abs(db.timeMs - target) / interval;
-              downbeatScore += db.confidence * Math.max(0, 1 - error / 0.24);
-              downbeatSupport++;
-            }
-          }
-        }
-
-        // Prefer a candidate supported by multiple bars. Downbeat evidence gets
-        // more weight than raw beat evidence because it is precisely what marks
-        // the bar boundary.
-        const coverage = support / Math.max(1, expectedCount);
-        const barCoverage = downbeatSupport / Math.max(2, Math.ceil(horizonBeats / barBeats));
-        const normalized = (beatScore / Math.max(1, expectedCount)) * 0.55 +
-          (downbeatScore / Math.max(1, expectedCount / barBeats)) * 0.35 +
-          coverage * 0.10;
-        const score = normalized + Math.min(0.15, barCoverage * 0.15);
-
-        if (!best || score > best.score) {
-          secondBest = best?.score ?? secondBest;
-          best = { score, anchorTime: anchor, interval, support, downbeatSupport };
-        } else if (score > secondBest) {
-          secondBest = score;
-        }
-      }
-    }
-
-    if (!best) return null;
-
-    // Confidence is deliberately conservative. We want AUTO to wait for several
-    // bars of evidence instead of confidently picking the wrong phase early on.
-    const margin = Math.max(0, best.score - secondBest);
-    const coverage = best.support / Math.max(1, Math.min(32, best.support + 8));
-    const barEvidence = Math.min(1, best.downbeatSupport / 3);
-    const confidence = Math.round(Math.max(0, Math.min(100,
-      best.score * 48 + margin * 70 + coverage * 18 + barEvidence * 14,
-    )));
-
-    if (confidence < 42) return null;
-
-    // The selected candidate is a musical downbeat. Snap it to the bar phase
-    // relative to the current listening time, so the UI can start immediately.
-    const elapsedBars = Math.max(0, Math.floor((performance.now() - best.anchorTime) / (best.interval * barBeats)));
-    const latestBarAnchor = best.anchorTime + elapsedBars * best.interval * barBeats;
-    return {
-      anchorTime: latestBarAnchor,
-      confidence,
-      beatInterval: best.interval,
-    };
-  }
-
-  private nearestNeuralEvent(
-    events: Array<{ timeMs: number; confidence: number; kind: 'beat' | 'downbeat' }>,
-    target: number,
-    tolerance: number,
-  ): { timeMs: number; confidence: number; kind: 'beat' | 'downbeat' } | null {
-    let best: { timeMs: number; confidence: number; kind: 'beat' | 'downbeat' } | null = null;
-    let bestDistance = tolerance;
-    for (const event of events) {
-      const distance = Math.abs(event.timeMs - target);
-      if (distance < bestDistance) {
-        best = event;
-        bestDistance = distance;
-      }
-    }
-    return best;
-  }
-
-  private uniqueSortedEvents(
-    events: Array<{ timeMs: number; confidence: number; kind: 'beat' | 'downbeat' }>,
-  ): Array<{ timeMs: number; confidence: number; kind: 'beat' | 'downbeat' }> {
-    const sorted = [...events].sort((a, b) => a.timeMs - b.timeMs);
-    const result: Array<{ timeMs: number; confidence: number; kind: 'beat' | 'downbeat' }> = [];
-    for (const event of sorted) {
-      const previous = result[result.length - 1];
-      if (
-        previous &&
-        previous.kind === event.kind &&
-        Math.abs(event.timeMs - previous.timeMs) <= 100
-      ) {
-        if (event.confidence > previous.confidence) {
-          result[result.length - 1] = event;
-        }
-      } else {
-        result.push(event);
-      }
-    }
-    return result;
   }
 
   private uniqueSortedTimes(times: number[]): number[] {
