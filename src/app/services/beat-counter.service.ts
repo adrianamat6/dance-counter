@@ -1,4 +1,5 @@
-import { Injectable, computed, signal } from '@angular/core';
+import { Injectable, computed, inject, signal } from '@angular/core';
+import { BeatThisService } from './beat-this.service';
 
 export type CounterMode = 'manual' | 'mic';
 
@@ -25,9 +26,19 @@ type Onset = {
  */
 @Injectable({ providedIn: 'root' })
 export class BeatCounterService {
+  private readonly beatThis = inject(BeatThisService);
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private micStream: MediaStream | null = null;
+  private scriptProcessor: ScriptProcessorNode | null = null;
+  private silentGain: GainNode | null = null;
+  private audioChunks: Float32Array[] = [];
+  private collectedAudioSamples = 0;
+  private totalCapturedSamples = 0;
+  private audioCaptureStartMs = 0;
+  private lastNeuralAnalysisMs = 0;
+  private neuralAnalysisBusy = false;
+  private neuralDownbeatTimesMs: number[] = [];
   private rafId: number | null = null;
   private beatTimerId: number | null = null;
 
@@ -55,6 +66,8 @@ export class BeatCounterService {
   readonly micError = signal<string | null>(null);
   readonly bpm = signal<number | null>(null);
   readonly oneConfidence = signal(0); // 0..100
+  readonly neuralReady = this.beatThis.ready;
+  readonly neuralProcessing = this.beatThis.processing;
   readonly beatIndexes = computed(() =>
     Array.from({ length: this.beatsPerBar() }, (_, i) => i),
   );
@@ -110,6 +123,9 @@ export class BeatCounterService {
     this.beatIntervals = [];
     this.previousSpectrum = null;
     this.autoOneLocked = false;
+    this.neuralDownbeatTimesMs = [];
+    this.totalCapturedSamples = 0;
+    this.audioCaptureStartMs = 0;
   }
 
   async startListening(): Promise<void> {
@@ -142,6 +158,29 @@ export class BeatCounterService {
       this.analyser.smoothingTimeConstant = 0.05;
       source.connect(this.analyser);
 
+      // Capture raw PCM in parallel for Beat This! inference. A zero-gain node
+      // avoids sending the microphone back to the phone speaker.
+      this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+      this.scriptProcessor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input);
+        this.audioChunks.push(copy);
+        if (!this.audioCaptureStartMs) this.audioCaptureStartMs = performance.now();
+        this.collectedAudioSamples += copy.length;
+        this.totalCapturedSamples += copy.length;
+        const maxSamples = Math.ceil((this.audioContext?.sampleRate ?? 48000) * 30);
+        while (this.collectedAudioSamples > maxSamples && this.audioChunks.length > 1) {
+          const removed = this.audioChunks.shift();
+          if (removed) this.collectedAudioSamples -= removed.length;
+        }
+        this.maybeRunNeuralAnalysis();
+      };
+      this.silentGain = this.audioContext.createGain();
+      this.silentGain.gain.value = 0;
+      source.connect(this.scriptProcessor);
+      this.scriptProcessor.connect(this.silentGain);
+      this.silentGain.connect(this.audioContext.destination);
+
       this.previousSpectrum = new Float32Array(this.analyser.frequencyBinCount);
       this.energyHistory = [];
       this.onsetHistory = [];
@@ -152,7 +191,15 @@ export class BeatCounterService {
       this.bpm.set(null);
       this.oneConfidence.set(0);
       this.autoOneLocked = false;
+      this.audioChunks = [];
+      this.collectedAudioSamples = 0;
+      this.totalCapturedSamples = 0;
+      this.audioCaptureStartMs = 0;
+      this.lastNeuralAnalysisMs = 0;
+      this.neuralAnalysisBusy = false;
+      this.neuralDownbeatTimesMs = [];
 
+      void this.beatThis.init();
       this.isListening.set(true);
       this.watchLoop();
     } catch (error) {
@@ -171,6 +218,19 @@ export class BeatCounterService {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
+
+    if (this.scriptProcessor) {
+      this.scriptProcessor.onaudioprocess = null;
+      this.scriptProcessor.disconnect();
+      this.scriptProcessor = null;
+    }
+    this.silentGain?.disconnect();
+    this.silentGain = null;
+    this.audioChunks = [];
+    this.collectedAudioSamples = 0;
+    this.totalCapturedSamples = 0;
+    this.audioCaptureStartMs = 0;
+    this.neuralAnalysisBusy = false;
 
     if (this.beatTimerId !== null) {
       window.clearInterval(this.beatTimerId);
@@ -490,6 +550,111 @@ export class BeatCounterService {
 
     const score = downbeatAccent * 0.72 + repetition * 0.28;
     return { score, means };
+  }
+
+  private maybeRunNeuralAnalysis(): void {
+    if (!this.isListening() || this.neuralAnalysisBusy || !this.audioContext) return;
+    const now = performance.now();
+    const sampleRate = this.audioContext.sampleRate;
+    const minSamples = Math.floor(sampleRate * 8);
+    if (this.collectedAudioSamples < minSamples) return;
+    if (now - this.lastNeuralAnalysisMs < 4500) return;
+
+    const windowSeconds = Math.min(14, this.collectedAudioSamples / sampleRate);
+    const windowSamples = Math.floor(windowSeconds * sampleRate);
+    const pcm = this.takeRecentAudio(windowSamples);
+    if (!pcm.length) return;
+
+    const capturedEndMs = this.audioCaptureStartMs + (this.totalCapturedSamples / sampleRate) * 1000;
+    const startTimeMs = capturedEndMs - windowSeconds * 1000;
+    this.lastNeuralAnalysisMs = now;
+    this.neuralAnalysisBusy = true;
+
+    void this.beatThis.analyze(pcm, sampleRate, startTimeMs).then((events) => {
+      const downbeats = events
+        .filter((event) => event.kind === 'downbeat' && event.confidence >= 0.45)
+        .map((event) => event.timeMs)
+        .filter((time) => Number.isFinite(time));
+
+      if (downbeats.length) {
+        this.neuralDownbeatTimesMs.push(...downbeats);
+        this.neuralDownbeatTimesMs = this.uniqueSortedTimes(this.neuralDownbeatTimesMs).slice(-24);
+        const latest = downbeats[downbeats.length - 1];
+        this.applyNeuralDownbeat(latest);
+      }
+    }).finally(() => {
+      this.neuralAnalysisBusy = false;
+    });
+  }
+
+  private takeRecentAudio(sampleCount: number): Float32Array {
+    const out = new Float32Array(sampleCount);
+    let write = sampleCount;
+    for (let i = this.audioChunks.length - 1; i >= 0 && write > 0; i--) {
+      const chunk = this.audioChunks[i];
+      const take = Math.min(chunk.length, write);
+      out.set(chunk.subarray(chunk.length - take), write - take);
+      write -= take;
+    }
+    return write === 0 ? out : out.subarray(write);
+  }
+
+  private applyNeuralDownbeat(timeMs: number): void {
+    const bpm = this.bpm();
+    if (!bpm || this.beatsPerBar() < 2) return;
+
+    const interval = 60000 / bpm;
+    const recent = this.neuralDownbeatTimesMs.slice(-6);
+
+    // A single neural downbeat is useful, but two or more consistent
+    // downbeats are much stronger evidence that we found the bar phase.
+    if (recent.length >= 2) {
+      const spacings = [];
+      for (let i = 1; i < recent.length; i++) {
+        spacings.push(recent[i] - recent[i - 1]);
+      }
+      const nearBar = spacings.filter((spacing) => {
+        const bars = spacing / (interval * 4);
+        return bars >= 0.75 && bars <= 1.25;
+      });
+
+      if (nearBar.length > 0) {
+        const confidence = this.beatThis.lastDownbeatConfidence();
+        if (confidence >= 45) {
+          // The model is explicitly predicting the bar start. Do not force
+          // this timestamp through the old onset phase heuristic: a correct
+          // neural downbeat can be exactly 1, 2 or 3 beats away from the
+          // heuristic's current phase. Instead, replace the phase anchor.
+          this.beatAnchorTime = timeMs;
+          this.currentBeat.set(this.getBeatAtTime(performance.now()));
+          this.oneConfidence.set(Math.max(this.oneConfidence(), confidence));
+          this.autoOneLocked = true;
+          this.scheduleNextBeat(performance.now());
+        }
+        return;
+      }
+    }
+
+    // During startup accept one confident model downbeat as a provisional
+    // anchor. A later consistent prediction will confirm/correct it.
+    if (!this.beatAnchorTime && this.beatThis.lastDownbeatConfidence() >= 55) {
+      this.beatAnchorTime = timeMs;
+      this.currentBeat.set(this.getBeatAtTime(performance.now()));
+      this.oneConfidence.set(this.beatThis.lastDownbeatConfidence());
+      this.autoOneLocked = true;
+      this.scheduleNextBeat(performance.now());
+    }
+  }
+
+  private uniqueSortedTimes(times: number[]): number[] {
+    const sorted = [...times].sort((a, b) => a - b);
+    const result: number[] = [];
+    for (const value of sorted) {
+      if (!result.length || Math.abs(value - result[result.length - 1]) > 120) {
+        result.push(value);
+      }
+    }
+    return result;
   }
 
   private registerManualBeat(now: number): void {

@@ -9,7 +9,8 @@
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
-    "lint": "ng lint"
+    "lint": "ng lint",
+    "prebuild": "node scripts/fetch-beat-model.mjs && node scripts/copy-onnx-runtime.mjs"
   },
   "private": true,
   "dependencies": {
@@ -32,7 +33,8 @@
     "ionicons": "^7.0.0",
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0",
-    "zone.js": "~0.15.0"
+    "zone.js": "~0.15.0",
+    "onnxruntime-web": "1.24.4"
   },
   "devDependencies": {
     "@angular-devkit/build-angular": "20.3.28",
