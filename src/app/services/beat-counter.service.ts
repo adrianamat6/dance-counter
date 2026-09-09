@@ -51,6 +51,7 @@ export class BeatCounterService {
   private beatAnchorTime = 0; // instante del beat 1 de la rejilla
   private nextScheduledBeatTime = 0;
   private autoOneLocked = false;
+  private lastNeuralBeatTimesMs: number[] = [];
 
   private readonly energyHistorySize = 60;
   private readonly intervalHistorySize = 18;
@@ -124,6 +125,7 @@ export class BeatCounterService {
     this.previousSpectrum = null;
     this.autoOneLocked = false;
     this.neuralDownbeatTimesMs = [];
+    this.lastNeuralBeatTimesMs = [];
     this.totalCapturedSamples = 0;
     this.audioCaptureStartMs = 0;
   }
@@ -198,6 +200,7 @@ export class BeatCounterService {
       this.lastNeuralAnalysisMs = 0;
       this.neuralAnalysisBusy = false;
       this.neuralDownbeatTimesMs = [];
+      this.lastNeuralBeatTimesMs = [];
 
       void this.beatThis.init();
       this.isListening.set(true);
@@ -433,8 +436,56 @@ export class BeatCounterService {
     const bpm = this.bpm();
     if (!bpm || !this.beatAnchorTime) return 1;
     const interval = 60000 / bpm;
-    const beatIndex = Math.max(0, Math.floor((time - this.beatAnchorTime) / interval));
+    const beatIndex = Math.max(0, Math.floor((time - this.beatAnchorTime) / interval + 1e-6));
     return (beatIndex % this.beatsPerBar()) + 1;
+  }
+
+  /**
+   * La cuenta de 8 no equivale a un compás de 8/4. En baile, normalmente
+   * estamos contando dos compases de 4: el segundo downbeat es el 5, no
+   * un nuevo 1. Por eso el ancla se fija una vez y la rejilla 1..8 continúa.
+   */
+  private musicalBarLength(): number {
+    return this.beatsPerBar() === 8 ? 4 : this.beatsPerBar();
+  }
+
+  private isConsistentDownbeat(timeMs: number): boolean {
+    const bpm = this.bpm();
+    if (!bpm || !this.beatAnchorTime) return false;
+
+    const interval = 60000 / bpm;
+    const barLength = this.musicalBarLength();
+    const beatsFromAnchor = (timeMs - this.beatAnchorTime) / interval;
+    const nearest = Math.round(beatsFromAnchor);
+    const error = Math.abs(beatsFromAnchor - nearest);
+
+    if (error > 0.18) return false;
+
+    // A detected downbeat must land on the start of a musical bar.
+    return ((nearest % barLength) + barLength) % barLength === 0;
+  }
+
+  private updateBpmFromNeuralBeats(times: number[]): void {
+    if (times.length < 3) return;
+
+    const sorted = this.uniqueSortedTimes(times);
+    const intervals: number[] = [];
+    for (let i = 1; i < sorted.length; i++) {
+      const delta = sorted[i] - sorted[i - 1];
+      if (delta >= 300 && delta <= 1000) intervals.push(delta);
+    }
+    if (intervals.length < 2) return;
+
+    intervals.sort((a, b) => a - b);
+    const median = intervals[Math.floor(intervals.length / 2)];
+    const candidate = Math.round(60000 / median);
+    if (candidate < 70 || candidate > 180) return;
+
+    const current = this.bpm();
+    if (!current || Math.abs(candidate - current) <= 4) {
+      this.bpm.set(candidate);
+      this.ensureBeatClock(performance.now());
+    }
   }
 
   private correctPhase(now: number): void {
@@ -571,16 +622,26 @@ export class BeatCounterService {
     this.neuralAnalysisBusy = true;
 
     void this.beatThis.analyze(pcm, sampleRate, startTimeMs).then((events) => {
+      const beats = events
+        .filter((event) => event.kind === 'beat' && event.confidence >= 0.40)
+        .map((event) => event.timeMs)
+        .filter((time) => Number.isFinite(time));
       const downbeats = events
         .filter((event) => event.kind === 'downbeat' && event.confidence >= 0.45)
         .map((event) => event.timeMs)
         .filter((time) => Number.isFinite(time));
 
+      if (beats.length) {
+        this.lastNeuralBeatTimesMs = beats.slice(-24);
+        this.updateBpmFromNeuralBeats(this.lastNeuralBeatTimesMs);
+      }
+
       if (downbeats.length) {
         this.neuralDownbeatTimesMs.push(...downbeats);
         this.neuralDownbeatTimesMs = this.uniqueSortedTimes(this.neuralDownbeatTimesMs).slice(-24);
-        const latest = downbeats[downbeats.length - 1];
-        this.applyNeuralDownbeat(latest);
+        for (const downbeat of downbeats) {
+          this.applyNeuralDownbeat(downbeat);
+        }
       }
     }).finally(() => {
       this.neuralAnalysisBusy = false;
@@ -603,47 +664,36 @@ export class BeatCounterService {
     const bpm = this.bpm();
     if (!bpm || this.beatsPerBar() < 2) return;
 
-    const interval = 60000 / bpm;
-    const recent = this.neuralDownbeatTimesMs.slice(-6);
+    const confidence = this.beatThis.lastDownbeatConfidence();
+    if (confidence < 45) return;
 
-    // A single neural downbeat is useful, but two or more consistent
-    // downbeats are much stronger evidence that we found the bar phase.
-    if (recent.length >= 2) {
-      const spacings = [];
-      for (let i = 1; i < recent.length; i++) {
-        spacings.push(recent[i] - recent[i - 1]);
-      }
-      const nearBar = spacings.filter((spacing) => {
-        const bars = spacing / (interval * 4);
-        return bars >= 0.75 && bars <= 1.25;
-      });
-
-      if (nearBar.length > 0) {
-        const confidence = this.beatThis.lastDownbeatConfidence();
-        if (confidence >= 45) {
-          // The model is explicitly predicting the bar start. Do not force
-          // this timestamp through the old onset phase heuristic: a correct
-          // neural downbeat can be exactly 1, 2 or 3 beats away from the
-          // heuristic's current phase. Instead, replace the phase anchor.
-          this.beatAnchorTime = timeMs;
-          this.currentBeat.set(this.getBeatAtTime(performance.now()));
-          this.oneConfidence.set(Math.max(this.oneConfidence(), confidence));
-          this.autoOneLocked = true;
-          this.scheduleNextBeat(performance.now());
-        }
-        return;
-      }
-    }
-
-    // During startup accept one confident model downbeat as a provisional
-    // anchor. A later consistent prediction will confirm/correct it.
-    if (!this.beatAnchorTime && this.beatThis.lastDownbeatConfidence() >= 55) {
+    // IMPORTANT: a downbeat is the start of a musical bar, not necessarily
+    // the start of our dance count. With an 8-count, bar 2 starts at 5.
+    if (!this.beatAnchorTime) {
       this.beatAnchorTime = timeMs;
       this.currentBeat.set(this.getBeatAtTime(performance.now()));
-      this.oneConfidence.set(this.beatThis.lastDownbeatConfidence());
-      this.autoOneLocked = true;
+      this.oneConfidence.set(confidence);
+      this.autoOneLocked = confidence >= 50;
       this.scheduleNextBeat(performance.now());
+      return;
     }
+
+    if (!this.isConsistentDownbeat(timeMs)) return;
+
+    // Do not reset the anchor to every downbeat. Use it only as a phase
+    // observation and make a very small correction so the grid can follow
+    // the real recording without jumping from 5 back to 1.
+    const interval = 60000 / bpm;
+    const beatIndex = Math.round((timeMs - this.beatAnchorTime) / interval);
+    const expected = this.beatAnchorTime + beatIndex * interval;
+    const error = timeMs - expected;
+    if (Math.abs(error) <= interval * 0.20) {
+      this.beatAnchorTime += error * 0.20;
+    }
+
+    this.oneConfidence.set(Math.max(this.oneConfidence(), confidence));
+    this.autoOneLocked = true;
+    this.currentBeat.set(this.getBeatAtTime(performance.now()));
   }
 
   private uniqueSortedTimes(times: number[]): number[] {
