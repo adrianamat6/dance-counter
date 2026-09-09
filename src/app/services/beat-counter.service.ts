@@ -275,8 +275,9 @@ export class BeatCounterService {
     }
 
     // Tras estabilizar BPM, buscamos el 1 automáticamente hasta encontrar
-    // una fase con suficiente confianza.
-    if (this.beatsPerBar() === 4 && !this.autoOneLocked && this.onsetHistory.length >= 12) {
+    // una fase con suficiente confianza. Funciona para cualquier compás
+    // (4, 8, 3...), no solo 4/4.
+    if (this.beatsPerBar() >= 2 && !this.autoOneLocked && this.onsetHistory.length >= 12) {
       this.detectOne();
     }
 
@@ -378,7 +379,7 @@ export class BeatCounterService {
 
   private correctPhase(now: number): void {
     const bpm = this.bpm();
-    if (!bpm || !this.beatAnchorTime || this.autoOneLocked) return;
+    if (!bpm || !this.beatAnchorTime) return;
 
     const interval = 60000 / bpm;
     const elapsed = now - this.beatAnchorTime;
@@ -387,8 +388,14 @@ export class BeatCounterService {
     const phaseError = now - ideal;
 
     // Solo corregimos ligeramente: el tempo ya lo controla la rejilla.
+    // Antes, en cuanto localizábamos el 1 (autoOneLocked) dejábamos de
+    // corregir del todo, lo que hacía que un pequeño error de BPM se
+    // fuera acumulando en canciones largas hasta desincronizar el conteo.
+    // Ahora seguimos corrigiendo siempre, pero mucho más suave una vez
+    // localizado el 1, para no "cazar" el downbeat de un lado a otro.
+    const alpha = this.autoOneLocked ? 0.025 : 0.08;
     if (Math.abs(phaseError) < interval * 0.15) {
-      this.beatAnchorTime += phaseError * 0.08;
+      this.beatAnchorTime += phaseError * alpha;
     }
   }
 
@@ -399,19 +406,25 @@ export class BeatCounterService {
    */
   private findBestDownbeat(): { anchorTime: number; confidence: number } | null {
     const bpm = this.bpm();
-    if (!bpm || this.beatsPerBar() !== 4 || this.onsetHistory.length < 10) {
+    const n = this.beatsPerBar();
+    // Con menos de 2 tiempos por compás no hay downbeat que distinguir.
+    // Con compases muy largos (>8) probamos solo las primeras 8 fases:
+    // más allá de eso el acento musical real (graves/armonía) ya no suele
+    // marcar la diferencia y solo añadimos ruido a la búsqueda.
+    if (!bpm || n < 2 || this.onsetHistory.length < 10) {
       return null;
     }
 
+    const phasesToTest = Math.min(n, 8);
     const interval = 60000 / bpm;
     const onsets = this.onsetHistory.slice(-this.downbeatWindowBeats * 2);
     if (onsets.length < 10) return null;
 
     const referenceTime = onsets[0].time;
-    const candidates = [0, 1, 2, 3].map((phase) => referenceTime + phase * interval);
+    const candidates = Array.from({ length: phasesToTest }, (_, phase) => referenceTime + phase * interval);
     const scored = candidates.map((anchorTime) => ({
       anchorTime,
-      ...this.scorePhase(anchorTime, interval, onsets),
+      ...this.scorePhase(anchorTime, interval, onsets, n),
     }));
 
     scored.sort((a, b) => b.score - a.score);
@@ -434,11 +447,11 @@ export class BeatCounterService {
     return { anchorTime: latestAnchor, confidence };
   }
 
-  private scorePhase(anchorTime: number, interval: number, onsets: Onset[]): {
+  private scorePhase(anchorTime: number, interval: number, onsets: Onset[], n: number): {
     score: number;
     means: number[];
   } {
-    const groups: number[][] = [[], [], [], []];
+    const groups: number[][] = Array.from({ length: n }, () => []);
     const tolerance = interval * 0.28;
 
     for (const onset of onsets) {
@@ -447,7 +460,7 @@ export class BeatCounterService {
       const error = Math.abs(beatFloat - nearest) * interval;
       if (error > tolerance) continue;
 
-      const position = ((nearest % 4) + 4) % 4;
+      const position = ((nearest % n) + n) % n;
       // Mezclamos el ataque con graves: para downbeat suele ser útil dar
       // algo más de peso al contenido grave.
       const weightedStrength = onset.strength * 0.75 + onset.lowEnergy * 0.25;
@@ -458,12 +471,15 @@ export class BeatCounterService {
       values.length ? this.mean(values) : 0,
     );
 
+    // Necesitamos señal en al menos ~el 60% de las posiciones para fiarnos
+    // del patrón (con n grande exigir "todas menos una" es poco realista).
     const nonZero = means.filter((value) => value > 0);
-    if (nonZero.length < 3) {
+    if (nonZero.length < Math.max(2, Math.ceil(n * 0.6))) {
       return { score: 0, means };
     }
 
-    const averageOther = (means[1] + means[2] + means[3]) / 3;
+    const others = means.slice(1);
+    const averageOther = this.mean(others);
     const total = this.mean(means);
     const downbeatAccent = total > 0 ? (means[0] - averageOther) / total : 0;
 
