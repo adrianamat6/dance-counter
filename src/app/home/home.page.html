@@ -42,6 +42,9 @@
       @if (counter.oneConfidence() > 0) {
         <p class="bpm">1 detectado: {{ counter.oneConfidence() }}%</p>
       }
+      @if (counter.neuralReady()) {
+        <p class="bpm ai-status">IA de ritmo activa</p>
+      }
     }
 
     @if (counter.micError(); as error) {
