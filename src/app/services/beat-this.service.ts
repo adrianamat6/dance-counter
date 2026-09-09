@@ -78,8 +78,8 @@ export class BeatThisService {
       feeds[inputName] = input;
 
       const output = await this.session.run(feeds);
-      const beatTensor = output.beat ?? output[this.session.outputNames[0]];
-      const downbeatTensor = output.downbeat ?? output[this.session.outputNames[1]];
+      const beatTensor = output['beat'] ?? output[this.session.outputNames[0]];
+      const downbeatTensor = output['downbeat'] ?? output[this.session.outputNames[1]];
       const beatLogits = this.tensorToFloat32(beatTensor);
       const downbeatLogits = this.tensorToFloat32(downbeatTensor);
 
